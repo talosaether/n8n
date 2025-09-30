@@ -20,6 +20,24 @@ NC='\033[0m' # No Color
 # Configuration
 BACKUP_DIR="${PROJECT_ROOT}/backups"
 
+# Detect Docker Compose command
+detect_compose_command() {
+    if docker compose version &> /dev/null; then
+        echo "docker compose"
+    elif command -v docker-compose &> /dev/null; then
+        echo "docker-compose"
+    else
+        return 1
+    fi
+}
+
+# Set Docker Compose command
+COMPOSE_CMD=$(detect_compose_command)
+if [ -z "$COMPOSE_CMD" ]; then
+    echo "Error: Docker Compose is not installed"
+    exit 1
+fi
+
 # Logging functions
 log_info() {
     echo -e "${GREEN}[INFO]${NC} $1"
@@ -95,7 +113,7 @@ restore_backup() {
 
     # Stop current deployment
     log_info "Stopping current n8n deployment..."
-    docker-compose down --timeout 30 || true
+    $COMPOSE_CMD down --timeout 30 || true
 
     # Restore configuration files
     if [ -f "${backup_path}/.env" ]; then
@@ -139,7 +157,7 @@ restore_backup() {
 
     # Start n8n
     log_info "Starting n8n..."
-    docker-compose up -d
+    $COMPOSE_CMD up -d
 
     # Wait for startup
     log_info "Waiting for n8n to start..."
@@ -158,7 +176,7 @@ restore_backup() {
         log_info "  - http://${host_ip}:5678"
     else
         log_error "n8n container failed to start"
-        log_error "Check logs with: docker-compose logs"
+        log_error "Check logs with: $COMPOSE_CMD logs"
         exit 1
     fi
 }

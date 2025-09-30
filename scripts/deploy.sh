@@ -41,6 +41,24 @@ log_error() {
 # Timestamp for deployment
 DEPLOY_TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
+# Detect Docker Compose command
+detect_compose_command() {
+    if docker compose version &> /dev/null; then
+        echo "docker compose"
+    elif command -v docker-compose &> /dev/null; then
+        echo "docker-compose"
+    else
+        return 1
+    fi
+}
+
+# Set Docker Compose command
+COMPOSE_CMD=$(detect_compose_command)
+if [ -z "$COMPOSE_CMD" ]; then
+    log_error "Docker Compose is not installed"
+    exit 1
+fi
+
 # Pre-flight checks
 preflight_checks() {
     log_info "Running pre-flight checks..."
@@ -52,7 +70,7 @@ preflight_checks() {
     fi
 
     # Check if Docker Compose is installed
-    if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null; then
+    if [ -z "$COMPOSE_CMD" ]; then
         log_error "Docker Compose is not installed"
         exit 1
     fi
@@ -141,17 +159,17 @@ deploy() {
 
     # Pull latest images
     log_info "Pulling latest Docker images..."
-    docker-compose pull
+    $COMPOSE_CMD pull
 
     # Stop existing containers gracefully
     if docker ps --format '{{.Names}}' | grep -q "^n8n$"; then
         log_info "Stopping existing n8n container..."
-        docker-compose down --timeout 30
+        $COMPOSE_CMD down --timeout 30
     fi
 
     # Start containers
     log_info "Starting n8n containers..."
-    docker-compose up -d
+    $COMPOSE_CMD up -d
 
     log_info "Deployment completed"
 }
@@ -214,7 +232,7 @@ rollback() {
 
     # Stop current deployment
     log_info "Stopping current deployment..."
-    docker-compose down --timeout 30
+    $COMPOSE_CMD down --timeout 30
 
     # Restore configuration files
     if [ -f "${backup_path}/.env" ]; then
@@ -240,7 +258,7 @@ rollback() {
 
     # Start containers with restored configuration
     log_info "Starting containers with restored configuration..."
-    docker-compose up -d
+    $COMPOSE_CMD up -d
 
     # Wait for health check
     sleep 10
@@ -278,10 +296,10 @@ display_info() {
     log_info "  - http://${host_ip}:5678"
     echo ""
     log_info "Container status:"
-    docker-compose ps
+    $COMPOSE_CMD ps
     echo ""
-    log_info "To view logs: docker-compose logs -f"
-    log_info "To stop: docker-compose down"
+    log_info "To view logs: $COMPOSE_CMD logs -f"
+    log_info "To stop: $COMPOSE_CMD down"
     log_info "To rollback: $0 --rollback"
 }
 
