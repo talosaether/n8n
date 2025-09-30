@@ -1,0 +1,202 @@
+name: Test n8n Deployment
+
+on:
+  pull_request:
+    branches:
+      - main
+      - master
+  push:
+    branches-ignore:
+      - main
+      - master
+  schedule:
+    # Run tests daily at 2 AM UTC
+    - cron: '0 2 * * *'
+
+env:
+  DOCKER_BUILDKIT: 1
+  COMPOSE_DOCKER_CLI_BUILD: 1
+
+jobs:
+  lint:
+    name: Lint Configuration Files
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate docker-compose.yml
+        run: docker-compose config > /dev/null
+
+      - name: Validate Dockerfile
+        run: docker build --no-cache -f Dockerfile --target test . || docker build --no-cache -f Dockerfile . > /dev/null
+
+      - name: Check shell scripts
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          find scripts -name "*.sh" -exec shellcheck {} +
+
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: n8n:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  integration-test:
+    name: Run Integration Tests
+    runs-on: ubuntu-latest
+    needs: [lint, build]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create test .env file
+        run: |
+          cat > .env <<EOF
+          HOST_IP=localhost
+          N8N_HOST=0.0.0.0
+          N8N_PORT=5678
+          N8N_PROTOCOL=http
+          WEBHOOK_URL=http://localhost:5678/
+          GENERIC_TIMEZONE=UTC
+          N8N_BASIC_AUTH_ACTIVE=true
+          N8N_BASIC_AUTH_USER=admin
+          N8N_BASIC_AUTH_PASSWORD=test-password-12345
+          N8N_LOG_LEVEL=info
+          N8N_LOG_OUTPUT=console
+          EXECUTIONS_TIMEOUT=3600
+          EXECUTIONS_TIMEOUT_MAX=7200
+          EOF
+
+      - name: Start n8n
+        run: |
+          docker-compose up -d
+          echo "Waiting for n8n to start..."
+          sleep 30
+
+      - name: Check container status
+        run: docker-compose ps
+
+      - name: Wait for n8n health check
+        run: |
+          timeout 120 bash -c 'until docker exec n8n wget --quiet --tries=1 --spider http://localhost:5678/healthz; do
+            echo "Waiting for n8n to be healthy..."
+            sleep 5
+          done'
+
+      - name: Run integration tests
+        run: |
+          chmod +x scripts/integration-tests.sh
+          ./scripts/integration-tests.sh
+
+      - name: Check n8n logs
+        if: always()
+        run: docker-compose logs n8n
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-results
+          path: test-results.log
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: docker-compose down -v
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'n8nio/n8n:latest'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  deployment-test:
+    name: Test Deployment Scripts
+    runs-on: ubuntu-latest
+    needs: [lint]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Make scripts executable
+        run: chmod +x scripts/*.sh
+
+      - name: Test backup script
+        run: |
+          # Create minimal environment for testing
+          cat > .env <<EOF
+          HOST_IP=localhost
+          N8N_BASIC_AUTH_USER=admin
+          N8N_BASIC_AUTH_PASSWORD=test-password
+          EOF
+
+          # Test backup script help
+          ./scripts/backup.sh --help
+
+      - name: Test restore script
+        run: ./scripts/restore.sh --help
+
+      - name: Test deploy script
+        run: ./scripts/deploy.sh --help
+
+      - name: Validate script syntax
+        run: |
+          bash -n scripts/deploy.sh
+          bash -n scripts/backup.sh
+          bash -n scripts/restore.sh
+          bash -n scripts/integration-tests.sh
+
+  report:
+    name: Test Report
+    runs-on: ubuntu-latest
+    needs: [integration-test, security-scan, deployment-test]
+    if: always()
+
+    steps:
+      - name: Generate test summary
+        run: |
+          echo "## Test Results Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Lint: ${{ needs.lint.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Build: ${{ needs.build.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Integration Tests: ${{ needs.integration-test.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Security Scan: ${{ needs.security-scan.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Deployment Test: ${{ needs.deployment-test.result }}" >> $GITHUB_STEP_SUMMARY

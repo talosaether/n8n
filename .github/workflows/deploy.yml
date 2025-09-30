@@ -1,0 +1,216 @@
+name: Deploy n8n
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+          - development
+
+env:
+  DOCKER_BUILDKIT: 1
+  COMPOSE_DOCKER_CLI_BUILD: 1
+
+jobs:
+  test:
+    name: Run Integration Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create .env file
+        run: |
+          cat > .env <<EOF
+          HOST_IP=localhost
+          N8N_HOST=0.0.0.0
+          N8N_PORT=5678
+          N8N_PROTOCOL=http
+          WEBHOOK_URL=http://localhost:5678/
+          GENERIC_TIMEZONE=UTC
+          N8N_BASIC_AUTH_ACTIVE=true
+          N8N_BASIC_AUTH_USER=admin
+          N8N_BASIC_AUTH_PASSWORD=${{ secrets.N8N_PASSWORD || 'test-password-ci' }}
+          N8N_LOG_LEVEL=info
+          N8N_LOG_OUTPUT=console
+          EXECUTIONS_TIMEOUT=3600
+          EXECUTIONS_TIMEOUT_MAX=7200
+          EOF
+
+      - name: Start n8n
+        run: |
+          docker-compose up -d
+          sleep 30
+
+      - name: Wait for n8n to be healthy
+        run: |
+          timeout 120 bash -c 'until docker exec n8n wget --quiet --tries=1 --spider http://localhost:5678/healthz; do sleep 5; done'
+
+      - name: Run integration tests
+        run: |
+          chmod +x scripts/integration-tests.sh
+          ./scripts/integration-tests.sh
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results.log
+
+      - name: Show logs on failure
+        if: failure()
+        run: docker-compose logs
+
+      - name: Cleanup
+        if: always()
+        run: docker-compose down -v
+
+  build:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKER_USERNAME }}/n8n-custom
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to Server
+    runs-on: ubuntu-latest
+    needs: [test, build]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    environment:
+      name: ${{ github.event.inputs.environment || 'production' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.DEPLOY_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Create deployment directory
+        run: |
+          ssh -i ~/.ssh/deploy_key ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} "mkdir -p /opt/n8n"
+
+      - name: Copy files to server
+        run: |
+          scp -i ~/.ssh/deploy_key docker-compose.yml ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/opt/n8n/
+          scp -i ~/.ssh/deploy_key Dockerfile ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/opt/n8n/
+          scp -r -i ~/.ssh/deploy_key scripts/ ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/opt/n8n/
+
+      - name: Create .env on server
+        run: |
+          ssh -i ~/.ssh/deploy_key ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} "cat > /opt/n8n/.env <<EOF
+          HOST_IP=${{ secrets.HOST_IP }}
+          N8N_HOST=0.0.0.0
+          N8N_PORT=5678
+          N8N_PROTOCOL=http
+          WEBHOOK_URL=http://${{ secrets.HOST_IP }}:5678/
+          GENERIC_TIMEZONE=UTC
+          N8N_BASIC_AUTH_ACTIVE=true
+          N8N_BASIC_AUTH_USER=${{ secrets.N8N_USER }}
+          N8N_BASIC_AUTH_PASSWORD=${{ secrets.N8N_PASSWORD }}
+          N8N_LOG_LEVEL=info
+          N8N_LOG_OUTPUT=console
+          EXECUTIONS_TIMEOUT=3600
+          EXECUTIONS_TIMEOUT_MAX=7200
+          EOF"
+
+      - name: Deploy n8n
+        run: |
+          ssh -i ~/.ssh/deploy_key ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} << 'ENDSSH'
+            cd /opt/n8n
+            chmod +x scripts/*.sh
+            ./scripts/deploy.sh
+          ENDSSH
+
+      - name: Run post-deployment tests
+        run: |
+          ssh -i ~/.ssh/deploy_key ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} << 'ENDSSH'
+            cd /opt/n8n
+            ./scripts/integration-tests.sh
+          ENDSSH
+
+      - name: Cleanup SSH keys
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
+
+      - name: Notify deployment status
+        if: always()
+        run: |
+          if [ ${{ job.status }} == 'success' ]; then
+            echo "Deployment successful!"
+          else
+            echo "Deployment failed!"
+          fi
+
+  notify:
+    name: Send Notification
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: always()
+
+    steps:
+      - name: Send success notification
+        if: needs.deploy.result == 'success'
+        run: |
+          echo "Deployment successful! n8n is running at http://${{ secrets.HOST_IP }}:5678"
+          # Add your notification logic here (Slack, Discord, Email, etc.)
+
+      - name: Send failure notification
+        if: needs.deploy.result == 'failure'
+        run: |
+          echo "Deployment failed! Check the logs for details."
+          # Add your notification logic here (Slack, Discord, Email, etc.)

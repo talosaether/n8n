@@ -1,0 +1,40 @@
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Backups
+backups/
+
+# Logs
+*.log
+deploy.log
+test-results.log
+
+# Docker
+.dockerignore
+
+# Git
+.git/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+.last_backup
+
+# Node modules (if any)
+node_modules/
+
+# Build artifacts
+dist/
+build/
